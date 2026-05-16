@@ -1,0 +1,38 @@
+# ─── Databricks Jobs Agent — Central Configuration ───────────────────────────
+# Edit this file to change catalog, schema, table names, or agent settings.
+# All notebooks read this via config_loader.py.
+
+catalog: main
+schema:  jobs_agent
+
+# ── Source tables (created by nb_00) ─────────────────────────────────────────
+tables:
+  jobs: jobs
+  runs: job_runs
+
+# ── UC Volume (created by nb_01) ─────────────────────────────────────────────
+volume:
+  name:      jobs_kb_volume
+  md_subdir: md_files
+
+# ── Vector Search (created by nb_01 / nb_03) ─────────────────────────────────
+vector_search:
+  endpoint_name:   jobs_agent_vs_endpoint
+  index_name:      jobs_kb_index
+  kb_table:        jobs_kb_chunks
+  embedding_model: databricks-bge-large-en
+  chunk_size:      800    # characters per chunk
+  chunk_overlap:   100    # overlap between consecutive chunks
+
+# ── Agent / Model Serving (nb_04 / nb_05) ────────────────────────────────────
+agent:
+  claude_endpoint:  databricks-claude-sonnet-4-5   # Databricks pay-per-token endpoint
+  model_name:       jobs_nl_agent
+  serving_endpoint: jobs_nl_agent_endpoint
+  max_agent_rounds: 6        # max ReAct loop iterations per question
+  max_tokens:       2048
+  temperature:      0
+
+# ── Access control ────────────────────────────────────────────────────────────
+grant_principals:
+  - account users             # replace / extend with specific group names

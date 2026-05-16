@@ -1,4 +1,7 @@
 # Databricks notebook source
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC # Notebook 04 — NL-to-SQL Agent (Claude Sonnet 4.5)
 # MAGIC
@@ -12,106 +15,165 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install databricks-vectorsearch openai --quiet
-dbutils.library.restartPython()
+# MAGIC %pip install databricks-vectorsearch openai tabulate --quiet
 
 # COMMAND ----------
 
-# MAGIC %run ./config
+# MAGIC %run ./config_loader
+
+# COMMAND ----------
+
+# ── IDE type stubs: Databricks runtime and config_loader inject these at runtime
+from __future__ import annotations
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    import logging
+    from pyspark.sql import SparkSession
+    spark: SparkSession
+    dbutils: Any
+    display: Any
+    log: logging.Logger
+    with_retry: Callable[..., Any]
+    CATALOG: str
+    SCHEMA: str
+    JOBS_TABLE: str
+    RUNS_TABLE: str
+    VOLUME_NAME: str
+    VOLUME_PATH: str
+    MD_FILES_PATH: str
+    VS_ENDPOINT_NAME: str
+    VS_INDEX_NAME: str
+    KB_DELTA_TABLE: str
+    EMBEDDING_MODEL: str
+    CHUNK_SIZE: int
+    CHUNK_OVERLAP: int
+    CLAUDE_ENDPOINT: str
+    AGENT_MODEL_NAME: str
+    AGENT_ENDPOINT: str
+    MAX_AGENT_ROUNDS: int
+    MAX_TOKENS: int
+    TEMPERATURE: float
+    GRANT_PRINCIPALS: list[str]
 
 # COMMAND ----------
 
 import json
 import re
 import textwrap
+import time
+
 import mlflow
 import openai
 
 from databricks.vector_search.client import VectorSearchClient
 
-# COMMAND ----------
-
-# MAGIC %md ## 1 — Workspace credentials
-# MAGIC
-# MAGIC The Databricks token is read from the notebook context — no manual secret needed
-# MAGIC when running interactively. For production, store in a Databricks secret scope.
-
-workspace_url = (
-    spark.conf.get("spark.databricks.workspaceUrl")
-    .strip("/")
-)
-token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
-
-# OpenAI-compatible client pointed at Databricks Foundation Model APIs
-llm_client = openai.OpenAI(
-    api_key  = token,
-    base_url = f"https://{workspace_url}/serving-endpoints",
-)
-
-print(f"Workspace : {workspace_url}")
-print(f"LLM model : {CLAUDE_ENDPOINT}")
+log.info("nb_04 started")
 
 # COMMAND ----------
 
-# MAGIC %md ## 2 — Tool: Search Knowledge Base
+# MAGIC %md
+# MAGIC ## 0 — Prerequisite check
 
-vsc = VectorSearchClient(disable_notice=True)
+# COMMAND ----------
+
+if not spark.catalog.tableExists(KB_DELTA_TABLE):
+    raise RuntimeError(
+        f"KB table {KB_DELTA_TABLE!r} not found. Run nb_01 first."
+    )
+
+log.info("Prerequisites OK")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 1 — Workspace credentials
+
+# COMMAND ----------
+
+_workspace_url = spark.conf.get("spark.databricks.workspaceUrl").strip("/")
+_token = (
+    dbutils.notebook.entry_point.getDbutils()
+    .notebook().getContext().apiToken().get()
+)
+
+_llm_client = openai.OpenAI(
+    api_key  = _token,
+    base_url = f"https://{_workspace_url}/serving-endpoints",
+)
+
+log.info(f"LLM endpoint: {CLAUDE_ENDPOINT}  workspace: {_workspace_url}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2 — Tool: Search Knowledge Base
+
+# COMMAND ----------
+
+_vsc = VectorSearchClient(disable_notice=True)
+
 
 def search_knowledge_base(query: str, num_results: int = 4) -> str:
     """Search the vector KB for job documentation matching the query."""
     try:
-        raw = vsc.get_index(
+        raw  = _vsc.get_index(
             endpoint_name = VS_ENDPOINT_NAME,
             index_name    = VS_INDEX_NAME,
         ).similarity_search(
             query_text  = query,
             columns     = ["job_id", "job_name", "chunk_index", "content"],
-            num_results = num_results,
+            num_results = min(num_results, 8),
         )
         rows = raw.get("result", {}).get("data_array", [])
         if not rows:
-            return "No relevant documentation found."
+            return "No relevant documentation found in the knowledge base."
 
         parts = []
         for job_id, job_name, chunk_idx, content, score in rows:
             parts.append(
-                f"### {job_name} (job_id={job_id}, chunk={chunk_idx}, score={score:.3f})\n{content}"
+                f"### {job_name} (job_id={job_id}, chunk={chunk_idx}, score={score:.3f})\n"
+                f"{content}"
             )
         return "\n\n---\n\n".join(parts)
-    except Exception as e:
-        return f"KB search error: {e}"
+    except Exception as exc:
+        log.error(f"KB search error: {exc}")
+        return f"KB search error: {exc}"
 
 # COMMAND ----------
 
-# MAGIC %md ## 3 — Tool: Execute SQL
+# MAGIC %md
+# MAGIC ## 3 — Tool: Execute SQL
 
-_ALLOWED_TABLES = {JOBS_TABLE, RUNS_TABLE, KB_DELTA_TABLE}
+# COMMAND ----------
 
 def _is_safe_sql(sql: str) -> bool:
-    """Block any write/DDL statement — only SELECT is permitted."""
-    clean = re.sub(r"--[^\n]*", "", sql)          # strip single-line comments
+    """Permit only SELECT statements — block all DDL/DML."""
+    clean = re.sub(r"--[^\n]*", "", sql)
     clean = re.sub(r"/\*.*?\*/", "", clean, flags=re.DOTALL)
     first = clean.strip().split()[0].upper() if clean.strip() else ""
     return first == "SELECT"
+
 
 def execute_sql(sql: str) -> str:
     """Run a SELECT query and return results as a Markdown table (max 50 rows)."""
     if not _is_safe_sql(sql):
         return "ERROR: Only SELECT statements are permitted."
     try:
-        df  = spark.sql(sql).limit(50)
-        pdf = df.toPandas()
-        if pdf.empty:
-            return "Query returned 0 rows."
-        return pdf.to_markdown(index=False)
-    except Exception as e:
-        return f"SQL execution error: {e}"
+        pdf = spark.sql(sql).limit(50).toPandas()
+        return "Query returned 0 rows." if pdf.empty else pdf.to_markdown(index=False)
+    except Exception as exc:
+        log.error(f"SQL error: {exc}\nSQL: {sql}")
+        return f"SQL execution error: {exc}"
 
 # COMMAND ----------
 
-# MAGIC %md ## 4 — Tool schemas (OpenAI function-calling format)
+# MAGIC %md
+# MAGIC ## 4 — Tool schemas (OpenAI function-calling format)
 
-TOOLS = [
+# COMMAND ----------
+
+_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
@@ -119,7 +181,7 @@ TOOLS = [
             "description": (
                 "Search the jobs knowledge base for documentation about specific jobs, "
                 "their configuration, schedule, tasks, and historical run patterns. "
-                "Use this FIRST to understand a job before writing SQL about it."
+                "Call this FIRST to understand a job before writing SQL about it."
             ),
             "parameters": {
                 "type": "object",
@@ -130,7 +192,7 @@ TOOLS = [
                     },
                     "num_results": {
                         "type": "integer",
-                        "description": "Number of chunks to retrieve (default 4, max 8).",
+                        "description": "Number of chunks to retrieve (1–8, default 4).",
                         "default": 4,
                     },
                 },
@@ -143,8 +205,8 @@ TOOLS = [
         "function": {
             "name": "execute_sql",
             "description": (
-                "Execute a SQL SELECT query against the Databricks jobs tables and return "
-                "the result as a Markdown table. Only SELECT is allowed."
+                "Execute a SQL SELECT query against the Databricks jobs tables "
+                "and return the result as a Markdown table. Only SELECT is allowed."
             ),
             "parameters": {
                 "type": "object",
@@ -162,21 +224,24 @@ TOOLS = [
 
 # COMMAND ----------
 
-# MAGIC %md ## 5 — System prompt
+# MAGIC %md
+# MAGIC ## 5 — System prompt
 
-SYSTEM_PROMPT = textwrap.dedent(f"""
+# COMMAND ----------
+
+_SYSTEM_PROMPT = textwrap.dedent(f"""
     You are a Databricks Jobs Intelligence Agent.
     You have access to two tools:
-      1. search_knowledge_base — retrieves rich documentation about jobs from the knowledge base
-      2. execute_sql — runs a SQL SELECT query against live Delta tables
+      1. search_knowledge_base — retrieves documentation about jobs from the knowledge base
+      2. execute_sql           — runs a SQL SELECT query against live Delta tables
 
     Available tables:
-      • {JOBS_TABLE}
+      • `{JOBS_TABLE}`
         Columns: job_id (INT), job_name (STRING), job_type (STRING), description (STRING),
                  owner (STRING), cluster_type (STRING), schedule_cron (STRING),
                  tags (STRING/JSON), created_at (TIMESTAMP)
 
-      • {RUNS_TABLE}
+      • `{RUNS_TABLE}`
         Columns: run_id (INT), job_id (INT), job_name (STRING), status (STRING),
                  start_time (TIMESTAMP), end_time (TIMESTAMP), duration_seconds (LONG),
                  tasks (STRING), error_message (STRING), triggered_by (STRING), run_url (STRING)
@@ -184,73 +249,80 @@ SYSTEM_PROMPT = textwrap.dedent(f"""
 
     Rules:
       - Always search the knowledge base first for context before writing SQL.
-      - Write precise Spark SQL; use backtick-quoted fully-qualified table names.
-      - Never guess — if unsure about a job name, query the jobs table.
+      - Write precise Spark SQL; use fully-qualified table names with backticks.
+      - Never guess job names — query the jobs table when unsure.
       - Present results clearly with Markdown formatting.
       - If a question cannot be answered from the available tables, say so honestly.
-      - Keep final answers concise: lead with the key insight, then supporting data.
+      - Lead with the key insight, then supporting data.
 """).strip()
 
 # COMMAND ----------
 
-# MAGIC %md ## 6 — Agent loop (`ask` function)
+# MAGIC %md
+# MAGIC ## 6 — Agent loop
 
-TOOL_MAP = {
+# COMMAND ----------
+
+_TOOL_MAP: dict[str, Callable] = {
     "search_knowledge_base": search_knowledge_base,
     "execute_sql":           execute_sql,
 }
 
-def ask(question: str, max_rounds: int = 6, verbose: bool = True) -> str:
-    """
-    Run the ReAct agent loop until Claude returns a final answer.
-    Returns the assistant's final text response.
-    """
-    messages = [
-        {"role": "system",  "content": SYSTEM_PROMPT},
-        {"role": "user",    "content": question},
+_FINAL_REASONS = {"stop", "end_turn"}
+
+
+def ask(question: str, verbose: bool = True) -> str:
+    """Run the ReAct loop and return the final answer."""
+    messages: list[dict] = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user",   "content": question},
     ]
 
-    for rnd in range(max_rounds):
+    for rnd in range(MAX_AGENT_ROUNDS):
         if verbose:
-            print(f"\n[Round {rnd + 1}]  Calling {CLAUDE_ENDPOINT} …")
+            log.info(f"[Round {rnd + 1}/{MAX_AGENT_ROUNDS}]  calling {CLAUDE_ENDPOINT} …")
 
-        response = llm_client.chat.completions.create(
-            model       = CLAUDE_ENDPOINT,
-            messages    = messages,
-            tools       = TOOLS,
-            max_tokens  = 2048,
-            temperature = 0,
-        )
+        try:
+            response = _llm_client.chat.completions.create(
+                model       = CLAUDE_ENDPOINT,
+                messages    = messages,
+                tools       = _TOOLS,
+                max_tokens  = MAX_TOKENS,
+                temperature = TEMPERATURE,
+            )
+        except openai.RateLimitError:
+            log.warning("Rate limited — waiting 30 s …")
+            time.sleep(30)
+            continue
+        except openai.APIError as exc:
+            log.error(f"API error: {exc}")
+            raise
 
         choice = response.choices[0]
 
-        # ── Final answer ──────────────────────────────────────────────────
-        if choice.finish_reason in ("stop", "end_turn"):
-            answer = choice.message.content
+        if choice.finish_reason in _FINAL_REASONS:
+            answer = choice.message.content or ""
             if verbose:
                 print(f"\n{'='*60}\nFINAL ANSWER\n{'='*60}\n{answer}")
             return answer
 
-        # ── Tool call(s) ──────────────────────────────────────────────────
         if choice.finish_reason == "tool_calls":
-            assistant_msg = choice.message
-            messages.append(assistant_msg)          # assistant turn with tool_calls
-
-            for tc in assistant_msg.tool_calls:
+            messages.append(choice.message)
+            for tc in choice.message.tool_calls:
                 fn_name = tc.function.name
                 fn_args = json.loads(tc.function.arguments)
 
                 if verbose:
-                    print(f"  → tool: {fn_name}({json.dumps(fn_args)[:120]})")
+                    log.info(f"  → tool: {fn_name}({json.dumps(fn_args)[:120]})")
 
-                if fn_name not in TOOL_MAP:
-                    result = f"ERROR: unknown tool '{fn_name}'"
-                else:
-                    result = TOOL_MAP[fn_name](**fn_args)
+                result = (
+                    _TOOL_MAP[fn_name](**fn_args)
+                    if fn_name in _TOOL_MAP
+                    else f"ERROR: unknown tool '{fn_name}'"
+                )
 
                 if verbose:
-                    preview = result[:300].replace("\n", " ")
-                    print(f"    ← {preview} …")
+                    log.info(f"    ← {result[:300].replace(chr(10), ' ')} …")
 
                 messages.append({
                     "role":         "tool",
@@ -259,31 +331,34 @@ def ask(question: str, max_rounds: int = 6, verbose: bool = True) -> str:
                 })
             continue
 
-        # Unexpected finish reason
+        log.warning(f"Unexpected finish_reason: {choice.finish_reason!r}")
         break
 
     return "Agent could not produce an answer within the allowed rounds."
 
 # COMMAND ----------
 
-# MAGIC %md ## 7 — Interactive tests
-
-q1 = "Which jobs have the highest failure rate, and what are the most common errors?"
-_ = ask(q1)
+# MAGIC %md
+# MAGIC ## 7 — Interactive tests
 
 # COMMAND ----------
 
-q2 = "Give me a summary of all ML-type jobs and their recent run performance."
-_ = ask(q2)
+_ = ask("Which jobs have the highest failure rate, and what are the most common errors?")
 
 # COMMAND ----------
 
-q3 = "Which job ran the longest on average, and what tasks does it include?"
-_ = ask(q3)
+_ = ask("Give me a summary of all ML-type jobs and their recent run performance.")
 
 # COMMAND ----------
 
-# MAGIC %md ## 8 — Wrap as MLflow pyfunc model
+_ = ask("Which job ran the longest on average, and what tasks does it include?")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 8 — MLflow pyfunc model wrapper
+
+# COMMAND ----------
 
 class JobsAgentModel(mlflow.pyfunc.PythonModel):
     """
@@ -292,29 +367,32 @@ class JobsAgentModel(mlflow.pyfunc.PythonModel):
     Output: {"role": "assistant", "content": "..."}
     """
 
-    def load_context(self, context):
-        import json, re, textwrap, openai
-        from databricks.vector_search.client import VectorSearchClient
-        # All globals (config vars, clients, helpers) are already in scope
-        # when running inside Databricks — no serialisation needed.
+    def load_context(self, context: mlflow.pyfunc.PythonModelContext) -> None:
+        import openai as _openai
+        import os
 
-    def predict(self, context, model_input, params=None):
+        self._workspace_url = os.environ.get("DATABRICKS_HOST", "").strip("/")
+        self._token         = os.environ.get("DATABRICKS_TOKEN", "")
+        self._llm_client    = _openai.OpenAI(
+            api_key  = self._token,
+            base_url = f"https://{self._workspace_url}/serving-endpoints",
+        )
+
+    def predict(
+        self,
+        context: mlflow.pyfunc.PythonModelContext,
+        model_input: Any,
+        params: Any = None,
+    ) -> dict:
         import pandas as pd
 
-        # Accept both dict and DataFrame inputs
-        if isinstance(model_input, pd.DataFrame):
-            payload = model_input.iloc[0].to_dict()
-        else:
-            payload = model_input
-
+        payload  = model_input.iloc[0].to_dict() if isinstance(model_input, pd.DataFrame) else model_input
         messages = payload.get("messages", [])
-        # Extract the last user message
-        user_text = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                user_text = m.get("content", "")
-                break
 
+        user_text = next(
+            (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"),
+            "",
+        )
         if not user_text:
             return {"role": "assistant", "content": "No question provided."}
 
@@ -323,42 +401,51 @@ class JobsAgentModel(mlflow.pyfunc.PythonModel):
 
 # COMMAND ----------
 
-# MAGIC %md ## 9 — Log model to MLflow
-
-mlflow.set_registry_uri("databricks-uc")
-
-with mlflow.start_run(run_name=AGENT_MODEL_NAME) as run:
-    mlflow.log_params({
-        "llm_endpoint":      CLAUDE_ENDPOINT,
-        "vs_endpoint":       VS_ENDPOINT_NAME,
-        "vs_index":          VS_INDEX_NAME,
-        "embedding_model":   EMBEDDING_MODEL,
-        "chunk_size":        CHUNK_SIZE,
-        "chunk_overlap":     CHUNK_OVERLAP,
-    })
-
-    model_info = mlflow.pyfunc.log_model(
-        artifact_path      = AGENT_MODEL_NAME,
-        python_model       = JobsAgentModel(),
-        registered_model_name = f"{CATALOG}.{SCHEMA}.{AGENT_MODEL_NAME}",
-        pip_requirements   = [
-            "databricks-vectorsearch",
-            "openai",
-            "tabulate",          # required by pandas .to_markdown()
-        ],
-    )
-
-    run_id = run.info.run_id
-
-print(f"Model logged  : {model_info.model_uri}")
-print(f"Run ID        : {run_id}")
-print(f"Registered    : {CATALOG}.{SCHEMA}.{AGENT_MODEL_NAME}")
+# MAGIC %md
+# MAGIC ## 9 — Log model to MLflow
 
 # COMMAND ----------
 
-# MAGIC %md ## 10 — Quick sanity check: load & call the logged model
+mlflow.set_registry_uri("databricks-uc")
 
-loaded = mlflow.pyfunc.load_model(model_info.model_uri)
-test_payload = {"messages": [{"role": "user", "content": "How many total job runs are in the system?"}]}
-result = loaded.predict(test_payload)
-print(result["content"])
+with mlflow.start_run(run_name=AGENT_MODEL_NAME) as _run:
+    mlflow.log_params({
+        "llm_endpoint":    CLAUDE_ENDPOINT,
+        "vs_endpoint":     VS_ENDPOINT_NAME,
+        "vs_index":        VS_INDEX_NAME,
+        "embedding_model": EMBEDDING_MODEL,
+        "chunk_size":      CHUNK_SIZE,
+        "chunk_overlap":   CHUNK_OVERLAP,
+        "max_rounds":      MAX_AGENT_ROUNDS,
+        "max_tokens":      MAX_TOKENS,
+        "temperature":     TEMPERATURE,
+    })
+
+    _model_info = mlflow.pyfunc.log_model(
+        artifact_path         = AGENT_MODEL_NAME,
+        python_model          = JobsAgentModel(),
+        registered_model_name = f"{CATALOG}.{SCHEMA}.{AGENT_MODEL_NAME}",
+        pip_requirements      = [
+            "databricks-vectorsearch",
+            "openai",
+            "tabulate",
+        ],
+    )
+
+log.info(f"Model logged  : {_model_info.model_uri}")
+log.info(f"Run ID        : {_run.info.run_id}")
+log.info(f"Registered as : {CATALOG}.{SCHEMA}.{AGENT_MODEL_NAME}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 10 — Sanity check: load & call the logged model
+
+# COMMAND ----------
+
+_loaded  = mlflow.pyfunc.load_model(_model_info.model_uri)
+_payload = {"messages": [{"role": "user", "content": "How many total job runs are in the system?"}]}
+_result  = _loaded.predict(_payload)
+print(_result["content"])
+
+log.info("nb_04 complete")

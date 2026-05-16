@@ -1,126 +1,187 @@
 # Databricks notebook source
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC # Notebook 03 — Chunk MD Files & Build Vector Search Index
 # MAGIC
 # MAGIC Pipeline:
 # MAGIC 1. Read every `.md` file from the UC Volume
 # MAGIC 2. Split content into overlapping character chunks
-# MAGIC 3. Write chunks to `jobs_kb_chunks` Delta table (CDF-enabled)
+# MAGIC 3. Write chunks to the `jobs_kb_chunks` Delta table (CDF-enabled)
 # MAGIC 4. Create a Vector Search **endpoint** (if absent)
 # MAGIC 5. Create a **Delta Sync index** backed by BGE embeddings (if absent)
-# MAGIC 6. Wait for the index to reach ONLINE status and verify with a test query
-
-# COMMAND ----------
-
-# MAGIC %run ./config
+# MAGIC 6. Wait for the index to reach ONLINE status and verify with a smoke-test query
 
 # COMMAND ----------
 
 # MAGIC %pip install databricks-vectorsearch --quiet
-dbutils.library.restartPython()
 
 # COMMAND ----------
 
-# MAGIC %run ./config
+# MAGIC %run ./config_loader
 
 # COMMAND ----------
 
-import uuid
-import time
+# ── IDE type stubs: Databricks runtime and config_loader inject these at runtime
+from __future__ import annotations
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    import logging
+    from pyspark.sql import SparkSession
+    spark: SparkSession
+    dbutils: Any
+    display: Any
+    log: logging.Logger
+    with_retry: Callable[..., Any]
+    CATALOG: str
+    SCHEMA: str
+    JOBS_TABLE: str
+    RUNS_TABLE: str
+    VOLUME_NAME: str
+    VOLUME_PATH: str
+    MD_FILES_PATH: str
+    VS_ENDPOINT_NAME: str
+    VS_INDEX_NAME: str
+    KB_DELTA_TABLE: str
+    EMBEDDING_MODEL: str
+    CHUNK_SIZE: int
+    CHUNK_OVERLAP: int
+    CLAUDE_ENDPOINT: str
+    AGENT_MODEL_NAME: str
+    AGENT_ENDPOINT: str
+    MAX_AGENT_ROUNDS: int
+    MAX_TOKENS: int
+    TEMPERATURE: float
+    GRANT_PRINCIPALS: list[str]
+
+# COMMAND ----------
+
 import re
+import time
+import uuid
 from datetime import datetime, timezone
 
 from pyspark.sql import Row
 from pyspark.sql.types import (
     StructType, StructField,
-    StringType, IntegerType, TimestampType
+    StringType, IntegerType, TimestampType,
 )
 from databricks.vector_search.client import VectorSearchClient
 
-# COMMAND ----------
-
-# MAGIC %md ## 1 — Read MD files from Volume
-
-md_files = [f for f in dbutils.fs.ls(MD_FILES_PATH) if f.name.endswith(".md")]
-print(f"Found {len(md_files)} MD files in {MD_FILES_PATH}\n")
-for f in md_files:
-    print(f"  {f.name:60s}  {f.size:>8,} bytes")
+log.info("nb_03 started")
 
 # COMMAND ----------
 
-# MAGIC %md ## 2 — Chunking helpers
+# MAGIC %md
+# MAGIC ## 0 — Prerequisite check
 
-def extract_job_id_from_filename(name: str) -> int:
-    """Pull the job_id from  {job_name}__{job_id}.md"""
-    m = re.search(r"__(\d+)\.md$", name)
-    return int(m.group(1)) if m else -1
+# COMMAND ----------
 
-def extract_job_name_from_filename(name: str) -> str:
-    """Pull the job_name slug from  {job_name}__{job_id}.md"""
-    return re.sub(r"__\d+\.md$", "", name).replace("_", " ")
+if not spark.catalog.tableExists(KB_DELTA_TABLE):
+    raise RuntimeError(
+        f"KB table {KB_DELTA_TABLE!r} not found. Run nb_01 first."
+    )
+
+_md_files = [f for f in dbutils.fs.ls(MD_FILES_PATH) if f.name.endswith(".md")]
+if not _md_files:
+    raise RuntimeError(
+        f"No .md files found in {MD_FILES_PATH!r}. Run nb_02 first."
+    )
+
+log.info(f"Found {len(_md_files)} MD files")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 1 — Read MD files from Volume
+
+# COMMAND ----------
+
+print(f"MD files in {MD_FILES_PATH} ({len(_md_files)} total):\n")
+for _f in _md_files:
+    print(f"  {_f.name:62s}  {_f.size:>8,} bytes")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2 — Chunking helpers
+
+# COMMAND ----------
+
+def _extract_job_id(filename: str) -> int:
+    m = re.search(r"__(\d+)\.md$", filename)
+    if not m:
+        raise ValueError(f"Cannot extract job_id from filename: {filename!r}")
+    return int(m.group(1))
+
+
+def _extract_job_name(filename: str) -> str:
+    return re.sub(r"__\d+\.md$", "", filename).replace("_", " ")
+
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
-    """
-    Split *text* into overlapping character-level chunks.
-    Tries to break on newlines to avoid cutting mid-sentence.
-    """
-    chunks = []
+    """Split text into overlapping chunks, preferring newline boundaries."""
+    chunks: list[str] = []
     start  = 0
     length = len(text)
 
     while start < length:
         end = min(start + chunk_size, length)
-
-        # Prefer to break on a newline within the last 20 % of the window
         if end < length:
-            snap_start = start + int(chunk_size * 0.80)
-            newline_pos = text.rfind("\n", snap_start, end)
-            if newline_pos != -1:
-                end = newline_pos + 1      # include the newline in this chunk
-
+            snap = start + int(chunk_size * 0.80)
+            nl   = text.rfind("\n", snap, end)
+            if nl != -1:
+                end = nl + 1
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
-
-        start = end - overlap              # step back by overlap
+        start = end - overlap
 
     return chunks
 
 # COMMAND ----------
 
-# MAGIC %md ## 3 — Build chunk rows
-
-chunk_rows = []
-
-for file_info in md_files:
-    filename = file_info.name
-    job_id   = extract_job_id_from_filename(filename)
-    job_name = extract_job_name_from_filename(filename)
-
-    raw_content = dbutils.fs.head(file_info.path, 1_000_000)  # read up to 1 MB
-    chunks      = chunk_text(raw_content, CHUNK_SIZE, CHUNK_OVERLAP)
-
-    for idx, chunk in enumerate(chunks):
-        chunk_rows.append(Row(
-            chunk_id    = str(uuid.uuid4()),
-            job_id      = job_id,
-            job_name    = job_name,
-            chunk_index = idx,
-            content     = chunk,
-            source_file = file_info.path,
-            created_at  = datetime.now(timezone.utc).replace(tzinfo=None),
-        ))
-
-print(f"Total chunks generated: {len(chunk_rows)}")
-print(f"  Chunk size   : {CHUNK_SIZE} chars")
-print(f"  Chunk overlap: {CHUNK_OVERLAP} chars")
-print(f"  Avg per file : {len(chunk_rows) / max(len(md_files), 1):.1f}")
+# MAGIC %md
+# MAGIC ## 3 — Build chunk rows
 
 # COMMAND ----------
 
-# MAGIC %md ## 4 — Write chunks to KB Delta table
+_chunk_rows: list[Row] = []
+_now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-chunks_schema = StructType([
+for _fi in _md_files:
+    _job_id   = _extract_job_id(_fi.name)
+    _job_name = _extract_job_name(_fi.name)
+    _content  = dbutils.fs.head(_fi.path, 1_000_000)
+    _chunks   = chunk_text(_content, CHUNK_SIZE, CHUNK_OVERLAP)
+
+    for _idx, _chunk in enumerate(_chunks):
+        _chunk_rows.append(Row(
+            chunk_id    = str(uuid.uuid4()),
+            job_id      = _job_id,
+            job_name    = _job_name,
+            chunk_index = _idx,
+            content     = _chunk,
+            source_file = _fi.path,
+            created_at  = _now,
+        ))
+
+log.info(
+    f"Chunks generated: {len(_chunk_rows)}  "
+    f"(size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}, "
+    f"avg/file={len(_chunk_rows)/max(len(_md_files),1):.1f})"
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4 — Write chunks to KB Delta table
+
+# COMMAND ----------
+
+_chunks_schema = StructType([
     StructField("chunk_id",    StringType(),    False),
     StructField("job_id",      IntegerType(),   True),
     StructField("job_name",    StringType(),    True),
@@ -130,126 +191,159 @@ chunks_schema = StructType([
     StructField("created_at",  TimestampType(), True),
 ])
 
-chunks_df = spark.createDataFrame(chunk_rows, schema=chunks_schema)
+_chunks_df = spark.createDataFrame(_chunk_rows, schema=_chunks_schema)
+_chunks_df.write.format("delta").mode("overwrite").saveAsTable(KB_DELTA_TABLE)
 
-# Overwrite so re-runs stay idempotent; CDF is preserved on overwrite
-chunks_df.write.format("delta").mode("overwrite").saveAsTable(KB_DELTA_TABLE)
-
-saved = spark.table(KB_DELTA_TABLE).count()
-print(f"Saved {saved} chunks → {KB_DELTA_TABLE}")
+_saved = spark.table(KB_DELTA_TABLE).count()
+assert _saved == len(_chunk_rows), \
+    f"Row count mismatch: expected {len(_chunk_rows)}, saved {_saved}"
+log.info(f"Saved {_saved} chunks → {KB_DELTA_TABLE}")
 display(spark.table(KB_DELTA_TABLE).limit(3))
 
 # COMMAND ----------
 
-# MAGIC %md ## 5 — Create Vector Search endpoint
-
-vsc = VectorSearchClient(disable_notice=True)
-
-def endpoint_exists(name: str) -> bool:
-    try:
-        ep = vsc.get_endpoint(name)
-        return ep.get("endpoint_status", {}).get("state") not in (None, "DELETED")
-    except Exception:
-        return False
-
-if endpoint_exists(VS_ENDPOINT_NAME):
-    print(f"Endpoint '{VS_ENDPOINT_NAME}' already exists — skipping creation.")
-else:
-    print(f"Creating VS endpoint '{VS_ENDPOINT_NAME}' …")
-    vsc.create_endpoint(
-        name          = VS_ENDPOINT_NAME,
-        endpoint_type = "STANDARD",
-    )
-    # Wait until provisioned
-    for _ in range(30):
-        state = vsc.get_endpoint(VS_ENDPOINT_NAME).get("endpoint_status", {}).get("state", "")
-        print(f"  endpoint state: {state}")
-        if state == "ONLINE":
-            break
-        time.sleep(20)
-    else:
-        raise TimeoutError("VS endpoint did not reach ONLINE within 10 minutes.")
-
-print(f"Endpoint '{VS_ENDPOINT_NAME}' is ONLINE.")
+# MAGIC %md
+# MAGIC ## 5 — Create Vector Search endpoint
 
 # COMMAND ----------
 
-# MAGIC %md ## 6 — Create Delta Sync index
-# MAGIC
-# MAGIC `SOURCE_DELTA` + `MANAGED` embeddings — Databricks computes and stores
-# MAGIC embeddings automatically using the BGE model; no manual embedding step needed.
+_vsc = VectorSearchClient(disable_notice=True)
 
-def index_exists(endpoint: str, index_name: str) -> bool:
+
+def _endpoint_is_online(name: str) -> bool:
     try:
-        vsc.get_index(endpoint_name=endpoint, index_name=index_name)
+        state = _vsc.get_endpoint(name).get("endpoint_status", {}).get("state", "")
+        return state == "ONLINE"
+    except Exception:
+        return False
+
+
+@with_retry(max_attempts=3, initial_delay=10.0)
+def _create_vs_endpoint() -> None:
+    _vsc.create_endpoint(name=VS_ENDPOINT_NAME, endpoint_type="STANDARD")
+
+
+if _endpoint_is_online(VS_ENDPOINT_NAME):
+    log.info(f"VS endpoint {VS_ENDPOINT_NAME!r} already ONLINE — skipping creation")
+else:
+    log.info(f"Creating VS endpoint {VS_ENDPOINT_NAME!r} …")
+    _create_vs_endpoint()
+
+    for _attempt in range(40):
+        _state = _vsc.get_endpoint(VS_ENDPOINT_NAME).get("endpoint_status", {}).get("state", "")
+        log.info(f"  [{_attempt+1:02d}] endpoint state: {_state}")
+        if _state == "ONLINE":
+            break
+        time.sleep(20)
+    else:
+        raise TimeoutError(
+            f"VS endpoint {VS_ENDPOINT_NAME!r} did not reach ONLINE within ~13 minutes."
+        )
+
+log.info(f"VS endpoint {VS_ENDPOINT_NAME!r} is ONLINE")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6 — Create Delta Sync index
+# MAGIC
+# MAGIC `TRIGGERED` pipeline — sync is explicit (cheaper on free edition).
+# MAGIC Change to `CONTINUOUS` for near-real-time updates in production.
+
+# COMMAND ----------
+
+def _index_exists() -> bool:
+    try:
+        _vsc.get_index(endpoint_name=VS_ENDPOINT_NAME, index_name=VS_INDEX_NAME)
         return True
     except Exception:
         return False
 
-if index_exists(VS_ENDPOINT_NAME, VS_INDEX_NAME):
-    print(f"Index '{VS_INDEX_NAME}' already exists — triggering sync instead.")
-    vsc.get_index(
-        endpoint_name = VS_ENDPOINT_NAME,
-        index_name    = VS_INDEX_NAME,
-    ).sync()
-else:
-    print(f"Creating VS index '{VS_INDEX_NAME}' …")
-    vsc.create_delta_sync_index(
-        endpoint_name          = VS_ENDPOINT_NAME,
-        index_name             = VS_INDEX_NAME,
-        source_table_name      = KB_DELTA_TABLE,
-        pipeline_type          = "TRIGGERED",       # manual sync; use CONTINUOUS for streaming
-        primary_key            = "chunk_id",
-        embedding_source_column= "content",
+
+@with_retry(max_attempts=3, initial_delay=15.0)
+def _create_vs_index() -> None:
+    _vsc.create_delta_sync_index(
+        endpoint_name                 = VS_ENDPOINT_NAME,
+        index_name                    = VS_INDEX_NAME,
+        source_table_name             = KB_DELTA_TABLE,
+        pipeline_type                 = "TRIGGERED",
+        primary_key                   = "chunk_id",
+        embedding_source_column       = "content",
         embedding_model_endpoint_name = EMBEDDING_MODEL,
     )
 
+
+if _index_exists():
+    log.info(f"Index {VS_INDEX_NAME!r} exists — triggering sync …")
+    _vsc.get_index(endpoint_name=VS_ENDPOINT_NAME, index_name=VS_INDEX_NAME).sync()
+else:
+    log.info(f"Creating VS index {VS_INDEX_NAME!r} …")
+    _create_vs_index()
+
 # COMMAND ----------
 
-# MAGIC %md ## 7 — Wait for index to reach ONLINE
+# MAGIC %md
+# MAGIC ## 7 — Wait for index to reach ONLINE
 
-print("Waiting for index to become ONLINE …")
-for attempt in range(40):
-    idx_info     = vsc.get_index(VS_ENDPOINT_NAME, VS_INDEX_NAME).describe()
-    index_state  = idx_info.get("status", {}).get("detailed_state", "UNKNOWN")
-    row_count    = idx_info.get("status", {}).get("indexed_row_count", 0)
-    print(f"  [{attempt+1:02d}] state={index_state:30s}  indexed_rows={row_count}")
-    if index_state in ("ONLINE", "ONLINE_NO_PENDING_UPDATE"):
+# COMMAND ----------
+
+_ONLINE_STATES = {"ONLINE", "ONLINE_NO_PENDING_UPDATE"}
+
+log.info("Waiting for index to become ONLINE …")
+for _attempt in range(40):
+    _idx_info    = _vsc.get_index(VS_ENDPOINT_NAME, VS_INDEX_NAME).describe()
+    _index_state = _idx_info.get("status", {}).get("detailed_state", "UNKNOWN")
+    _row_count   = _idx_info.get("status", {}).get("indexed_row_count", 0)
+    log.info(f"  [{_attempt+1:02d}] state={_index_state:35s}  indexed_rows={_row_count}")
+
+    if _index_state in _ONLINE_STATES:
         break
     time.sleep(15)
 else:
-    raise TimeoutError("VS index did not reach ONLINE within ~10 minutes.")
+    raise TimeoutError(
+        f"VS index {VS_INDEX_NAME!r} did not reach ONLINE within ~10 minutes."
+    )
 
-print(f"\nIndex is ready — {row_count} rows indexed.")
+log.info(f"Index ONLINE — {_row_count} rows indexed")
 
 # COMMAND ----------
 
-# MAGIC %md ## 8 — Smoke test: similarity search
+# MAGIC %md
+# MAGIC ## 8 — Smoke test
 
-test_query = "jobs that failed recently with spark exception errors"
+# COMMAND ----------
 
-results = vsc.get_index(VS_ENDPOINT_NAME, VS_INDEX_NAME).similarity_search(
-    query_text   = test_query,
-    columns      = ["chunk_id", "job_id", "job_name", "chunk_index", "content"],
-    num_results  = 3,
+_test_query = "jobs that failed recently with spark exception errors"
+
+_results = _vsc.get_index(VS_ENDPOINT_NAME, VS_INDEX_NAME).similarity_search(
+    query_text  = _test_query,
+    columns     = ["chunk_id", "job_id", "job_name", "chunk_index", "content"],
+    num_results = 3,
 )
 
-print(f"Query: '{test_query}'\n")
-for i, row in enumerate(results.get("result", {}).get("data_array", []), 1):
-    chunk_id, job_id, job_name, chunk_idx, content, score = row
-    print(f"Result {i} — job: {job_name} (id={job_id})  chunk={chunk_idx}  score={score:.4f}")
-    print(f"  {content[:200].replace(chr(10), ' ')}")
+print(f"Query: '{_test_query}'\n")
+for _i, _row in enumerate(
+    _results.get("result", {}).get("data_array", []), 1
+):
+    _cid, _jid, _jname, _cidx, _content, _score = _row
+    print(f"Result {_i} — {_jname} (id={_jid})  chunk={_cidx}  score={_score:.4f}")
+    print(f"  {_content[:200].replace(chr(10), ' ')}")
     print()
 
 # COMMAND ----------
 
-# MAGIC %md ## Summary
+# MAGIC %md
+# MAGIC ## Summary
 
-print(f"{'Resource':<28} {'Value'}")
+# COMMAND ----------
+
+print(f"{'Resource':<28} Value")
 print("-" * 72)
-print(f"{'MD files read':<28} {len(md_files)}")
-print(f"{'Total chunks written':<28} {saved}")
+print(f"{'MD files read':<28} {len(_md_files)}")
+print(f"{'Total chunks written':<28} {_saved}")
 print(f"{'KB Delta table':<28} {KB_DELTA_TABLE}")
 print(f"{'VS endpoint':<28} {VS_ENDPOINT_NAME}")
 print(f"{'VS index':<28} {VS_INDEX_NAME}")
 print(f"{'Embedding model':<28} {EMBEDDING_MODEL}")
+
+log.info("nb_03 complete")
