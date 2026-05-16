@@ -148,39 +148,6 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
 
 # COMMAND ----------
 
-_chunk_rows: list[Row] = []
-_now = datetime.now(timezone.utc).replace(tzinfo=None)
-
-for _fi in _md_files:
-    _job_id   = _extract_job_id(_fi.name)
-    _job_name = _extract_job_name(_fi.name)
-    _content  = dbutils.fs.head(_fi.path, 1_000_000)
-    _chunks   = chunk_text(_content, CHUNK_SIZE, CHUNK_OVERLAP)
-
-    for _idx, _chunk in enumerate(_chunks):
-        _chunk_rows.append(Row(
-            chunk_id    = str(uuid.uuid4()),
-            job_id      = _job_id,
-            job_name    = _job_name,
-            chunk_index = _idx,
-            content     = _chunk,
-            source_file = _fi.path,
-            created_at  = _now,
-        ))
-
-log.info(
-    f"Chunks generated: {len(_chunk_rows)}  "
-    f"(size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}, "
-    f"avg/file={len(_chunk_rows)/max(len(_md_files),1):.1f})"
-)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 4 — Write chunks to KB Delta table
-
-# COMMAND ----------
-
 _chunks_schema = StructType([
     StructField("chunk_id",    StringType(),    False),
     StructField("job_id",      IntegerType(),   True),
@@ -191,12 +158,50 @@ _chunks_schema = StructType([
     StructField("created_at",  TimestampType(), True),
 ])
 
-_chunks_df = spark.createDataFrame(_chunk_rows, schema=_chunks_schema)
-_chunks_df.write.format("delta").mode("overwrite").saveAsTable(KB_DELTA_TABLE)
+_total_chunks = 0
+_now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+for _fi_idx, _fi in enumerate(_md_files):
+    _job_id   = _extract_job_id(_fi.name)
+    _job_name = _extract_job_name(_fi.name)
+    _content  = dbutils.fs.head(_fi.path, 1_000_000)
+    _file_chunks = chunk_text(_content, CHUNK_SIZE, CHUNK_OVERLAP)
+
+    _rows = [
+        Row(
+            chunk_id    = str(uuid.uuid4()),
+            job_id      = _job_id,
+            job_name    = _job_name,
+            chunk_index = _idx,
+            content     = _chunk,
+            source_file = _fi.path,
+            created_at  = _now,
+        )
+        for _idx, _chunk in enumerate(_file_chunks)
+    ]
+
+    _df   = spark.createDataFrame(_rows, schema=_chunks_schema)
+    _mode = "overwrite" if _fi_idx == 0 else "append"
+    _df.write.format("delta").mode(_mode).saveAsTable(KB_DELTA_TABLE)
+    _total_chunks += len(_rows)
+    log.info(f"  {_fi.name}: {len(_rows)} chunks")
+
+log.info(
+    f"Chunks generated: {_total_chunks}  "
+    f"(size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}, "
+    f"avg/file={_total_chunks/max(len(_md_files),1):.1f})"
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4 — Write chunks to KB Delta table
+
+# COMMAND ----------
 
 _saved = spark.table(KB_DELTA_TABLE).count()
-assert _saved == len(_chunk_rows), \
-    f"Row count mismatch: expected {len(_chunk_rows)}, saved {_saved}"
+assert _saved == _total_chunks, \
+    f"Row count mismatch: expected {_total_chunks}, saved {_saved}"
 log.info(f"Saved {_saved} chunks → {KB_DELTA_TABLE}")
 display(spark.table(KB_DELTA_TABLE).limit(3))
 

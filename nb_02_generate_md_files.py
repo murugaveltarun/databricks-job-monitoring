@@ -84,51 +84,60 @@ log.info("Prerequisites OK")
 # COMMAND ----------
 
 stats_df = spark.sql(f"""
+    WITH last_run AS (
+        SELECT
+            job_id,
+            status           AS last_run_status,
+            start_time       AS last_run_start,
+            duration_seconds AS last_run_duration_sec,
+            tasks            AS last_run_tasks,
+            triggered_by     AS last_run_triggered_by,
+            run_url          AS last_run_url,
+            ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY start_time DESC) AS rn
+        FROM {RUNS_TABLE}
+    ),
+    agg AS (
+        SELECT
+            j.job_id,
+            j.job_name,
+            j.job_type,
+            j.description,
+            j.owner,
+            j.cluster_type,
+            j.schedule_cron,
+            j.tags,
+            j.created_at,
+
+            COUNT(r.run_id)                                              AS total_runs,
+            SUM(CASE WHEN r.status = 'SUCCESS'   THEN 1 ELSE 0 END)     AS success_count,
+            SUM(CASE WHEN r.status = 'FAILED'    THEN 1 ELSE 0 END)     AS failed_count,
+            SUM(CASE WHEN r.status = 'TIMEDOUT'  THEN 1 ELSE 0 END)     AS timeout_count,
+            SUM(CASE WHEN r.status = 'CANCELLED' THEN 1 ELSE 0 END)     AS cancelled_count,
+            ROUND(
+                SUM(CASE WHEN r.status = 'SUCCESS' THEN 1 ELSE 0 END)
+                / NULLIF(COUNT(r.run_id), 0) * 100, 1
+            )                                                            AS success_rate_pct,
+
+            ROUND(AVG(r.duration_seconds), 0)                           AS avg_duration_sec,
+            ROUND(MIN(r.duration_seconds), 0)                           AS min_duration_sec,
+            ROUND(MAX(r.duration_seconds), 0)                           AS max_duration_sec
+        FROM {JOBS_TABLE} j
+        LEFT JOIN {RUNS_TABLE} r USING (job_id)
+        GROUP BY
+            j.job_id, j.job_name, j.job_type, j.description, j.owner,
+            j.cluster_type, j.schedule_cron, j.tags, j.created_at
+    )
     SELECT
-        j.job_id,
-        j.job_name,
-        j.job_type,
-        j.description,
-        j.owner,
-        j.cluster_type,
-        j.schedule_cron,
-        j.tags,
-        j.created_at,
-
-        COUNT(r.run_id)                                              AS total_runs,
-        SUM(CASE WHEN r.status = 'SUCCESS'   THEN 1 ELSE 0 END)     AS success_count,
-        SUM(CASE WHEN r.status = 'FAILED'    THEN 1 ELSE 0 END)     AS failed_count,
-        SUM(CASE WHEN r.status = 'TIMEDOUT'  THEN 1 ELSE 0 END)     AS timeout_count,
-        SUM(CASE WHEN r.status = 'CANCELLED' THEN 1 ELSE 0 END)     AS cancelled_count,
-        ROUND(
-            SUM(CASE WHEN r.status = 'SUCCESS' THEN 1 ELSE 0 END)
-            / NULLIF(COUNT(r.run_id), 0) * 100, 1
-        )                                                            AS success_rate_pct,
-
-        ROUND(AVG(r.duration_seconds), 0)                           AS avg_duration_sec,
-        ROUND(MIN(r.duration_seconds), 0)                           AS min_duration_sec,
-        ROUND(MAX(r.duration_seconds), 0)                           AS max_duration_sec,
-
-        MAX(r.start_time)                                           AS last_run_start,
-        FIRST_VALUE(r.status) OVER (
-            PARTITION BY j.job_id ORDER BY r.start_time DESC
-        )                                                           AS last_run_status,
-        FIRST_VALUE(r.duration_seconds) OVER (
-            PARTITION BY j.job_id ORDER BY r.start_time DESC
-        )                                                           AS last_run_duration_sec,
-        FIRST_VALUE(r.tasks) OVER (
-            PARTITION BY j.job_id ORDER BY r.start_time DESC
-        )                                                           AS last_run_tasks,
-        FIRST_VALUE(r.triggered_by) OVER (
-            PARTITION BY j.job_id ORDER BY r.start_time DESC
-        )                                                           AS last_run_triggered_by,
-        FIRST_VALUE(r.run_url) OVER (
-            PARTITION BY j.job_id ORDER BY r.start_time DESC
-        )                                                           AS last_run_url
-    FROM {JOBS_TABLE} j
-    LEFT JOIN {RUNS_TABLE} r USING (job_id)
-    GROUP BY ALL
-""").dropDuplicates(["job_id"])
+        a.*,
+        lr.last_run_status,
+        lr.last_run_start,
+        lr.last_run_duration_sec,
+        lr.last_run_tasks,
+        lr.last_run_triggered_by,
+        lr.last_run_url
+    FROM agg a
+    LEFT JOIN last_run lr ON a.job_id = lr.job_id AND lr.rn = 1
+""")
 
 job_count = stats_df.count()
 log.info(f"Jobs to document: {job_count}")
