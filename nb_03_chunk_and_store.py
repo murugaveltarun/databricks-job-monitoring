@@ -268,9 +268,21 @@ def _create_vs_index() -> None:
     )
 
 
+# States where the pipeline is already running — calling .sync() would raise BadRequest
+_SYNC_IN_PROGRESS = {"INITIALIZING", "RUNNING", "EDITING"}
+# Terminal states where a new .sync() is valid
+_SYNC_ALLOWED     = {"COMPLETED", "FAILED", "CANCELED"}
+
 if _index_exists():
-    log.info(f"Index {VS_INDEX_NAME!r} exists — triggering sync …")
-    _vsc.get_index(endpoint_name=VS_ENDPOINT_NAME, index_name=VS_INDEX_NAME).sync()
+    _idx_desc      = _vsc.get_index(endpoint_name=VS_ENDPOINT_NAME, index_name=VS_INDEX_NAME).describe()
+    _pipeline_state = _idx_desc.get("status", {}).get("detailed_state", "UNKNOWN")
+    if _pipeline_state in _SYNC_IN_PROGRESS:
+        log.info(f"Index {VS_INDEX_NAME!r} pipeline is {_pipeline_state!r} — already syncing, skipping .sync() call")
+    elif _pipeline_state in _SYNC_ALLOWED:
+        log.info(f"Index {VS_INDEX_NAME!r} pipeline is {_pipeline_state!r} — triggering sync …")
+        _vsc.get_index(endpoint_name=VS_ENDPOINT_NAME, index_name=VS_INDEX_NAME).sync()
+    else:
+        log.warning(f"Index {VS_INDEX_NAME!r} pipeline is in unexpected state {_pipeline_state!r} — skipping sync")
 else:
     log.info(f"Creating VS index {VS_INDEX_NAME!r} …")
     _create_vs_index()
