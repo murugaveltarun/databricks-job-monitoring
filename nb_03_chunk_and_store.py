@@ -299,7 +299,7 @@ while _elapsed < _MAX_WAIT_SECONDS:
     _attempt    += 1
     log.info(f"  [{_attempt:02d}] state={_index_state:35s}  indexed_rows={_row_count}  elapsed={_elapsed}s")
 
-    if _index_state in _ONLINE_STATES:
+    if _index_state in _ONLINE_STATES and _row_count > 0:
         break
 
     _sleep = _POLL_SLOW if _index_state in _SLOW_STATES else _POLL_FAST
@@ -322,11 +322,24 @@ log.info(f"Index ONLINE — {_row_count} rows indexed")
 
 _test_query = "jobs that failed recently with spark exception errors"
 
-_results = _vsc.get_index(VS_ENDPOINT_NAME, VS_INDEX_NAME).similarity_search(
-    query_text  = _test_query,
-    columns     = ["chunk_id", "job_id", "job_name", "chunk_index", "content"],
-    num_results = 3,
-)
+_results = None
+for _s_attempt in range(10):
+    try:
+        _results = _vsc.get_index(VS_ENDPOINT_NAME, VS_INDEX_NAME).similarity_search(
+            query_text  = _test_query,
+            columns     = ["chunk_id", "job_id", "job_name", "chunk_index", "content"],
+            num_results = 3,
+        )
+        break
+    except Exception as _e:
+        if "not ready" in str(_e).lower() and _s_attempt < 9:
+            log.info(f"  Index not yet serving queries, retrying in 30s … ({_s_attempt+1}/10)")
+            time.sleep(30)
+        else:
+            raise
+
+if _results is None:
+    raise RuntimeError("Smoke test failed: index did not become queryable after retries.")
 
 print(f"Query: '{_test_query}'\n")
 for _i, _row in enumerate(
