@@ -59,12 +59,11 @@ if TYPE_CHECKING:
 
 # COMMAND ----------
 
-import re
 import time
 from datetime import datetime, timezone
 
 from pyspark.sql import functions as F
-from pyspark.sql.types import ArrayType, IntegerType, StringType, TimestampType
+from pyspark.sql.types import IntegerType, TimestampType
 from databricks.vector_search.client import VectorSearchClient
 
 log.info("nb_03 started")
@@ -107,17 +106,6 @@ for _f in _md_files:
 
 # COMMAND ----------
 
-def _extract_job_id(filename: str) -> int:
-    m = re.search(r"__(\d+)\.md$", filename)
-    if not m:
-        raise ValueError(f"Cannot extract job_id from filename: {filename!r}")
-    return int(m.group(1))
-
-
-def _extract_job_name(filename: str) -> str:
-    return re.sub(r"__\d+\.md$", "", filename).replace("_", " ")
-
-
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
     """Split text into overlapping chunks, preferring newline boundaries."""
     chunks: list[str] = []
@@ -145,38 +133,40 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
 
 # COMMAND ----------
 
-_now = datetime.now(timezone.utc).replace(tzinfo=None)
+_now    = datetime.now(timezone.utc).replace(tzinfo=None)
+_stride = CHUNK_SIZE - CHUNK_OVERLAP
 
-# UDFs — chunking and metadata extraction run on Spark workers, not the driver
-_chunk_udf    = F.udf(
-    lambda text: chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP) if text else [],
-    ArrayType(StringType()),
-)
-_job_id_udf   = F.udf(lambda p: _extract_job_id(p.rsplit("/", 1)[-1]),   IntegerType())
-_job_name_udf = F.udf(lambda p: _extract_job_name(p.rsplit("/", 1)[-1]), StringType())
-
-# Spark reads files in parallel across workers — no driver memory pressure
+# --- read files (JVM only, no Python workers involved) ---
 _raw_df = (
     spark.read
     .option("wholetext", "true")
     .text(MD_FILES_PATH)
     .select(
-        F.input_file_name().alias("source_file"),
+        F.col("_metadata.file_path").alias("source_file"),
         F.col("value").alias("raw_content"),
     )
     .filter(F.col("source_file").like("%.md"))
 )
 
-# Chunk + explode into one row per chunk, then write in a single Spark job
+# Filename column reused for job_id / job_name extraction
+_fname = F.element_at(F.split(F.col("source_file"), "/"), -1)
+
+# Pure Spark SQL — sequence→substring→posexplode, zero Python workers
 _chunks_df = (
     _raw_df
-    .withColumn("job_id",   _job_id_udf("source_file"))
-    .withColumn("job_name", _job_name_udf("source_file"))
-    .withColumn("chunks",   _chunk_udf("raw_content"))
-    .select(
-        "job_id", "job_name", "source_file",
-        F.posexplode("chunks").alias("chunk_index", "content"),
+    .withColumn(
+        "starts",
+        F.sequence(F.lit(1), F.length("raw_content"), F.lit(_stride)),
     )
+    .select(
+        "source_file", "raw_content",
+        F.posexplode("starts").alias("chunk_index", "start_pos"),
+    )
+    .withColumn("content", F.trim(F.substring("raw_content", F.col("start_pos"), F.lit(CHUNK_SIZE))))
+    .drop("raw_content", "start_pos")           # free large column early
+    .filter(F.length(F.col("content")) > 0)
+    .withColumn("job_id",   F.regexp_extract(_fname, r"__(\d+)\.md$", 1).cast(IntegerType()))
+    .withColumn("job_name", F.regexp_replace(F.regexp_replace(_fname, r"__\d+\.md$", ""), "_", " "))
     .withColumn("chunk_id",   F.expr("uuid()"))
     .withColumn("created_at", F.lit(_now).cast(TimestampType()))
     .select("chunk_id", "job_id", "job_name", "chunk_index",
