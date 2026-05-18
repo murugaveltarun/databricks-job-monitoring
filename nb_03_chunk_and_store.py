@@ -282,21 +282,33 @@ else:
 
 # COMMAND ----------
 
-_ONLINE_STATES = {"ONLINE", "ONLINE_NO_PENDING_UPDATE"}
+_ONLINE_STATES       = {"ONLINE", "ONLINE_NO_PENDING_UPDATE"}
+# States where the endpoint itself is still booting — poll slowly to avoid noise
+_SLOW_STATES         = {"PROVISIONING_ENDPOINT", "ENDPOINT_PROVISIONING"}
+_MAX_WAIT_SECONDS    = 2400   # 40 min — endpoint cold-start can take 15-30 min
+_POLL_SLOW           = 60     # seconds between polls while endpoint is booting
+_POLL_FAST           = 15     # seconds between polls once endpoint is ready
 
 log.info("Waiting for index to become ONLINE …")
-for _attempt in range(40):
+_elapsed = 0
+_attempt = 0
+while _elapsed < _MAX_WAIT_SECONDS:
     _idx_info    = _vsc.get_index(VS_ENDPOINT_NAME, VS_INDEX_NAME).describe()
     _index_state = _idx_info.get("status", {}).get("detailed_state", "UNKNOWN")
     _row_count   = _idx_info.get("status", {}).get("indexed_row_count", 0)
-    log.info(f"  [{_attempt+1:02d}] state={_index_state:35s}  indexed_rows={_row_count}")
+    _attempt    += 1
+    log.info(f"  [{_attempt:02d}] state={_index_state:35s}  indexed_rows={_row_count}  elapsed={_elapsed}s")
 
     if _index_state in _ONLINE_STATES:
         break
-    time.sleep(15)
+
+    _sleep = _POLL_SLOW if _index_state in _SLOW_STATES else _POLL_FAST
+    time.sleep(_sleep)
+    _elapsed += _sleep
 else:
     raise TimeoutError(
-        f"VS index {VS_INDEX_NAME!r} did not reach ONLINE within ~10 minutes."
+        f"VS index {VS_INDEX_NAME!r} did not reach ONLINE within {_MAX_WAIT_SECONDS // 60} minutes. "
+        f"Last state: {_index_state!r}"
     )
 
 log.info(f"Index ONLINE — {_row_count} rows indexed")
