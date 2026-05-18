@@ -16,6 +16,7 @@
 # COMMAND ----------
 
 # MAGIC %pip install databricks-vectorsearch --quiet
+dbutils.library.restartPython()
 
 # COMMAND ----------
 
@@ -60,14 +61,10 @@ if TYPE_CHECKING:
 
 import re
 import time
-import uuid
 from datetime import datetime, timezone
 
-from pyspark.sql import Row
-from pyspark.sql.types import (
-    StructType, StructField,
-    StringType, IntegerType, TimestampType,
-)
+from pyspark.sql import functions as F
+from pyspark.sql.types import ArrayType, IntegerType, StringType, TimestampType
 from databricks.vector_search.client import VectorSearchClient
 
 log.info("nb_03 started")
@@ -148,48 +145,51 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
 
 # COMMAND ----------
 
-_chunks_schema = StructType([
-    StructField("chunk_id",    StringType(),    False),
-    StructField("job_id",      IntegerType(),   True),
-    StructField("job_name",    StringType(),    True),
-    StructField("chunk_index", IntegerType(),   True),
-    StructField("content",     StringType(),    True),
-    StructField("source_file", StringType(),    True),
-    StructField("created_at",  TimestampType(), True),
-])
-
-_total_chunks = 0
 _now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-for _fi_idx, _fi in enumerate(_md_files):
-    _job_id   = _extract_job_id(_fi.name)
-    _job_name = _extract_job_name(_fi.name)
-    _content  = dbutils.fs.head(_fi.path, 1_000_000)
-    _file_chunks = chunk_text(_content, CHUNK_SIZE, CHUNK_OVERLAP)
+# UDFs — chunking and metadata extraction run on Spark workers, not the driver
+_chunk_udf    = F.udf(
+    lambda text: chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP) if text else [],
+    ArrayType(StringType()),
+)
+_job_id_udf   = F.udf(lambda p: _extract_job_id(p.rsplit("/", 1)[-1]),   IntegerType())
+_job_name_udf = F.udf(lambda p: _extract_job_name(p.rsplit("/", 1)[-1]), StringType())
 
-    _rows = [
-        Row(
-            chunk_id    = str(uuid.uuid4()),
-            job_id      = _job_id,
-            job_name    = _job_name,
-            chunk_index = _idx,
-            content     = _chunk,
-            source_file = _fi.path,
-            created_at  = _now,
-        )
-        for _idx, _chunk in enumerate(_file_chunks)
-    ]
+# Spark reads files in parallel across workers — no driver memory pressure
+_raw_df = (
+    spark.read
+    .option("wholetext", "true")
+    .text(MD_FILES_PATH)
+    .select(
+        F.input_file_name().alias("source_file"),
+        F.col("value").alias("raw_content"),
+    )
+    .filter(F.col("source_file").like("%.md"))
+)
 
-    _df   = spark.createDataFrame(_rows, schema=_chunks_schema)
-    _mode = "overwrite" if _fi_idx == 0 else "append"
-    _df.write.format("delta").mode(_mode).saveAsTable(KB_DELTA_TABLE)
-    _total_chunks += len(_rows)
-    log.info(f"  {_fi.name}: {len(_rows)} chunks")
+# Chunk + explode into one row per chunk, then write in a single Spark job
+_chunks_df = (
+    _raw_df
+    .withColumn("job_id",   _job_id_udf("source_file"))
+    .withColumn("job_name", _job_name_udf("source_file"))
+    .withColumn("chunks",   _chunk_udf("raw_content"))
+    .select(
+        "job_id", "job_name", "source_file",
+        F.posexplode("chunks").alias("chunk_index", "content"),
+    )
+    .withColumn("chunk_id",   F.expr("uuid()"))
+    .withColumn("created_at", F.lit(_now).cast(TimestampType()))
+    .select("chunk_id", "job_id", "job_name", "chunk_index",
+            "content", "source_file", "created_at")
+)
 
+_chunks_df.write.format("delta").mode("overwrite").saveAsTable(KB_DELTA_TABLE)
+
+_total_chunks = spark.table(KB_DELTA_TABLE).count()
 log.info(
     f"Chunks generated: {_total_chunks}  "
     f"(size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}, "
-    f"avg/file={_total_chunks/max(len(_md_files),1):.1f})"
+    f"avg/file={_total_chunks / max(len(_md_files), 1):.1f})"
 )
 
 # COMMAND ----------
